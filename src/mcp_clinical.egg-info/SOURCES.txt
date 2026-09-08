@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+src/mcp_clinical/__init__.py
+src/mcp_clinical/server.py
+src/mcp_clinical.egg-info/PKG-INFO
+src/mcp_clinical.egg-info/SOURCES.txt
+src/mcp_clinical.egg-info/dependency_links.txt
+src/mcp_clinical.egg-info/entry_points.txt
+src/mcp_clinical.egg-info/requires.txt
+src/mcp_clinical.egg-info/top_level.txt

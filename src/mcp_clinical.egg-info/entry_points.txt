@@ -1,0 +1,2 @@
+[console_scripts]
+mcp-clinical = mcp_clinical.server:main

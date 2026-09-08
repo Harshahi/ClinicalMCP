@@ -7,6 +7,30 @@ This project exposes an MCP server that can:
 
 ## Local setup
 
+### Run with Docker Compose
+
+1. Copy the example env file:
+
+   cp .env.example .env
+
+2. Update the values in `.env` with a real PAT if you want to use one:
+
+   MCP_PAT=your_personal_access_token
+   MCP_ACCESS_URL=http://localhost:8000/mcp
+   MCP_PUBLIC_URL=http://localhost
+   MCP_HOST=0.0.0.0
+   MCP_PORT=8000
+
+3. Start the app with Docker Compose:
+
+   docker compose up --build
+
+4. The server will be available at:
+
+   http://localhost:8000/mcp
+
+### Run directly with Python
+
 1. Create a virtual environment if you want one.
 2. Install dependencies:
 

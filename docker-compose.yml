@@ -1,0 +1,14 @@
+services:
+  clinicalmcp:
+    build:
+      context: .
+    container_name: clinicalmcp
+    ports:
+      - "8000:8000"
+    environment:
+      MCP_PAT: ${MCP_PAT:-demo-pat-123}
+      MCP_ACCESS_URL: ${MCP_ACCESS_URL:-http://ec2-18-191-206-22.us-east-2.compute.amazonaws.com:8000/mcp}
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-http://ec2-18-191-206-22.us-east-2.compute.amazonaws.com}
+      MCP_HOST: ${MCP_HOST:-0.0.0.0}
+      MCP_PORT: ${MCP_PORT:-8000}
+    restart: unless-stopped

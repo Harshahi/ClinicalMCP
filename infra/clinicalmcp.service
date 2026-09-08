@@ -1,0 +1,15 @@
+[Unit]
+Description=ClinicalMCP Server
+After=network.target
+
+[Service]
+WorkingDirectory=/home/ubuntu/ClinicalMCP
+EnvironmentFile=/home/ubuntu/ClinicalMCP/.env
+ExecStart=/home/ubuntu/ClinicalMCP/.venv/bin/python -m mcp_clinical.server
+Restart=always
+RestartSec=5
+User=ubuntu
+Group=ubuntu
+
+[Install]
+WantedBy=multi-user.target

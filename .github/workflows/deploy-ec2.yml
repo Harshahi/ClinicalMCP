@@ -190,14 +190,28 @@ jobs:
             done
 
             # Same request through nginx, to prove the proxy path works too.
-            PROXY_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/mcp" \
-              -X POST -H "Authorization: Bearer ${MCP_PAT}" \
-              -H 'Content-Type: application/json' \
-              -H 'Accept: application/json, text/event-stream' \
-              -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"deploy-smoke","version":"1"}}}')
-            echo "Through nginx: HTTP ${PROXY_CODE}"
+            # `systemctl reload` only sends SIGHUP and returns immediately, so the new
+            # config is not necessarily live yet. Retry rather than racing the reload:
+            # checking once here returned 404 from the outgoing default site.
+            echo "Waiting for nginx to serve the new config..."
+            PROXY_CODE=000
+            for i in $(seq 1 20); do
+              PROXY_CODE=$(curl -s -m 15 -o /dev/null -w '%{http_code}' "http://127.0.0.1/mcp" \
+                -X POST -H "Authorization: Bearer ${MCP_PAT}" \
+                -H 'Content-Type: application/json' \
+                -H 'Accept: application/json, text/event-stream' \
+                -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"deploy-smoke","version":"1"}}}')
+              if [ "$PROXY_CODE" = "200" ]; then
+                echo "Through nginx: HTTP 200"
+                break
+              fi
+              echo "  attempt ${i}: HTTP ${PROXY_CODE}, retrying..."
+              sleep 2
+            done
             if [ "$PROXY_CODE" != "200" ]; then
-              echo "Proxy check failed."
+              echo "Proxy check failed after 20 attempts (last: HTTP ${PROXY_CODE})."
+              echo "Active server blocks on :80:"
+              sudo nginx -T 2>/dev/null | grep -nE 'server_name|listen' || true
               sudo tail -n 40 /var/log/nginx/error.log || true
               exit 1
             fi

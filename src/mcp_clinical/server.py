@@ -2,13 +2,16 @@ import os
 from typing import Any
 
 import httpx
+import uvicorn
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 load_dotenv()
 
 DEFAULT_PAT = "development-token"
-MCP_PAT = os.getenv("MCP_PAT", DEFAULT_PAT)
+MCP_PAT = os.getenv("MCP_PAT", "")
 MCP_ACCESS_URL = os.getenv("MCP_ACCESS_URL", "http://localhost:8000/mcp")
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
@@ -23,16 +26,9 @@ mcp = FastMCP(
 
 def _auth_headers() -> dict[str, str]:
     headers = {"Accept": "application/json"}
-    if MCP_PAT and MCP_PAT != DEFAULT_PAT:
+    if MCP_PAT:
         headers["Authorization"] = f"Bearer {MCP_PAT}"
     return headers
-
-
-def _require_pat() -> None:
-    if not MCP_PAT or MCP_PAT == DEFAULT_PAT:
-        raise RuntimeError(
-            "MCP_PAT is not configured. Set MCP_PAT to a real bearer token before starting the server."
-        )
 
 
 @mcp.tool()
@@ -52,39 +48,39 @@ def clinical_trials_search(condition: str, max_results: int = 5) -> list[dict[st
     if not condition or not condition.strip():
         raise ValueError("A condition or keyword is required.")
     cleaned = condition.strip()
-    url = "https://clinicaltrials.gov/api/query/study_fields"
-    params = {
-        "expr": f'AREA[ConditionSearch] "{cleaned}"',
-        "fields": "NCTId,BriefTitle,Condition,OverallStatus,StudyType,PrimaryCompletionDate,BriefSummary",
-        "min_rnk": 1,
-        "max_rnk": max(1, min(25, max_results)),
-        "fmt": "json",
-    }
+    url = "https://clinicaltrials.gov/api/v2/studies"
+    params = {"query.term": cleaned, "pageSize": max(1, min(25, max_results)), "format": "json"}
 
     with httpx.Client(timeout=20.0) as client:
         response = client.get(url, params=params, headers=_auth_headers())
         response.raise_for_status()
         payload = response.json()
 
-    studies = payload.get("StudyFieldsResponse", {}).get("StudyFields", [])
+    studies = payload.get("studies", [])
     result: list[dict[str, Any]] = []
-    for study in studies:
-        fields = study.get("StudyFields", [])
-        mapping: dict[str, Any] = {}
-        for field in fields:
-            key = field.get("Field")
-            value = field.get("FieldValue")
-            if key:
-                mapping[key] = value
+    for study in studies[: max(1, min(25, max_results))]:
+        protocol = study.get("protocolSection", {})
+        identification = protocol.get("identificationModule", {})
+        conditions_module = protocol.get("conditionsModule", {})
+        status_module = protocol.get("statusModule", {})
+        design_module = protocol.get("designModule", {})
+        description_module = protocol.get("descriptionModule", {})
+
+        condition_items = conditions_module.get("conditions", [])
+        condition_name = next(
+            (item.get("condition") for item in condition_items if isinstance(item, dict) and item.get("condition")),
+            None,
+        )
+
         result.append(
             {
-                "nct_id": mapping.get("NCTId"),
-                "brief_title": mapping.get("BriefTitle"),
-                "condition": mapping.get("Condition"),
-                "overall_status": mapping.get("OverallStatus"),
-                "study_type": mapping.get("StudyType"),
-                "primary_completion_date": mapping.get("PrimaryCompletionDate"),
-                "brief_summary": mapping.get("BriefSummary"),
+                "nct_id": identification.get("nctId"),
+                "brief_title": identification.get("briefTitle"),
+                "condition": condition_name,
+                "overall_status": status_module.get("overallStatus"),
+                "study_type": design_module.get("studyType"),
+                "primary_completion_date": status_module.get("primaryCompletionDate"),
+                "brief_summary": description_module.get("briefSummary"),
             }
         )
     return result
@@ -96,15 +92,72 @@ def get_company_price(ticker: str, range_name: str = "1d") -> dict[str, Any]:
     if not ticker or not ticker.strip():
         raise ValueError("A ticker symbol is required.")
     symbol = ticker.strip().upper()
+
+    api_key = os.getenv("FINNHUB_API_KEY")
+    if api_key:
+        url = "https://finnhub.io/api/v1/quote"
+        params = {"symbol": symbol, "token": api_key}
+        try:
+            with httpx.Client(timeout=20.0) as client:
+                response = client.get(url, params=params, headers={"Accept": "application/json"})
+                response.raise_for_status()
+                payload = response.json()
+        except (httpx.HTTPStatusError, httpx.RequestError):
+            payload = {}
+
+        if payload:
+            return {
+                "ticker": symbol,
+                "currency": "USD",
+                "price": payload.get("c"),
+                "previous_close": payload.get("pc"),
+                "regular_market_price": payload.get("c"),
+                "market_state": "closed" if payload.get("c") is not None else None,
+                "exchange": "NASDAQ",
+                "source": "Finnhub",
+            }
+
+    twelve_data_key = os.getenv("TWELVEDATA_API_KEY", "demo")
+    twelve_data_url = "https://api.twelvedata.com/price"
+    twelve_data_params = {"symbol": symbol, "apikey": twelve_data_key}
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            response = client.get(twelve_data_url, params=twelve_data_params, headers={"Accept": "application/json"})
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        payload = {}
+
+    if payload and payload.get("price") is not None:
+        price_value = payload.get("price")
+        try:
+            price_value = float(price_value)
+        except (TypeError, ValueError):
+            price_value = None
+        if price_value is not None:
+            return {
+                "ticker": symbol,
+                "currency": "USD",
+                "price": price_value,
+                "previous_close": None,
+                "regular_market_price": price_value,
+                "market_state": "open",
+                "exchange": "NASDAQ",
+                "source": "Twelve Data",
+            }
+
     if range_name not in {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"}:
         raise ValueError("Unsupported range_name. Use one of: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max.")
 
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"range": range_name, "interval": "1d" if range_name in {"1d", "5d"} else "1mo"}
-    with httpx.Client(timeout=20.0) as client:
-        response = client.get(url, params=params, headers=_auth_headers())
-        response.raise_for_status()
-        payload = response.json()
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            response = client.get(url, params=params, headers=_auth_headers())
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        raise RuntimeError(f"Unable to fetch price data for {symbol} from the configured market data source.")
 
     result = payload.get("chart", {}).get("result", [{}])[0]
     meta = result.get("meta", {})
@@ -124,12 +177,38 @@ def get_company_price(ticker: str, range_name: str = "1d") -> dict[str, Any]:
     }
 
 
+class RequirePatMiddleware(BaseHTTPMiddleware):
+    """Require a bearer token when a PAT is configured on the server."""
+
+    async def dispatch(self, request, call_next):
+        if not MCP_PAT:
+            return await call_next(request)
+
+        if request.url.path.startswith("/mcp") or request.url.path == "/":
+            auth_header = request.headers.get("Authorization", "")
+            token = auth_header.split(" ", 1)[1].strip() if " " in auth_header else ""
+            if not auth_header.lower().startswith("bearer ") or token != MCP_PAT:
+                return JSONResponse(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32001,
+                            "message": "Unauthorized: send Authorization: Bearer <your_pat>",
+                        },
+                    },
+                    status_code=401,
+                )
+        return await call_next(request)
+
+
 def main() -> None:
-    _require_pat()
     print(f"Starting Clinical Research MCP server on {MCP_HOST}:{MCP_PORT}")
     print(f"Access URL: {MCP_ACCESS_URL}")
-    print(f"PAT env var: MCP_PAT (value is set: {bool(MCP_PAT and MCP_PAT != DEFAULT_PAT)})")
-    mcp.run(transport="streamable-http")
+    print(f"PAT env var: MCP_PAT (value is set: {bool(MCP_PAT)})")
+
+    app = RequirePatMiddleware(mcp.streamable_http_app())
+    uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)
 
 
 if __name__ == "__main__":

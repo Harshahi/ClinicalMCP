@@ -1,0 +1,21 @@
+# Secrets — never bake these into an image layer
+.env
+*.pem
+*.key
+
+# Local virtualenv (macOS build, useless and huge inside a linux image)
+.venv/
+
+# VCS and caches
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# Dev-only files not needed at runtime
+tests/
+*.ipynb
+infra/
+.github/

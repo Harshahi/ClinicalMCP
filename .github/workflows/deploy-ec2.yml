@@ -5,10 +5,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
+concurrency:
+  # Never let two deploys race on the same instance.
+  group: deploy-ec2
+  cancel-in-progress: false
 
+jobs:
+  test:
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -18,66 +22,122 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Install package locally
+      - name: Install package and test deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
+          python -m pip install . pytest
 
+      - name: Run tests
+        run: python -m pytest -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.1.0
+        env:
+          MCP_PAT: ${{ secrets.MCP_PAT }}
+          MCP_PUBLIC_URL: ${{ secrets.MCP_PUBLIC_URL }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          SERVER_NAME: ${{ secrets.EC2_HOST }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          # Secrets travel as env vars, not inlined into the script text.
+          envs: MCP_PAT,MCP_PUBLIC_URL,FINNHUB_API_KEY,TWELVEDATA_API_KEY,SERVER_NAME
+          script_stop: true
           script: |
-            set -e
-            if [ ! -d /home/ubuntu/ClinicalMCP/.git ]; then
-              git clone git@github.com:Harshahi/ClinicalMCP.git /home/ubuntu/ClinicalMCP
+            set -euo pipefail
+
+            APP_DIR=/home/ubuntu/ClinicalMCP
+            REPO_URL=https://github.com/Harshahi/ClinicalMCP.git
+
+            # Optional secrets default to empty so `set -u` does not abort on them.
+            : "${FINNHUB_API_KEY:=}"
+            : "${TWELVEDATA_API_KEY:=}"
+            : "${MCP_PAT:=}"
+            : "${MCP_PUBLIC_URL:=}"
+            : "${SERVER_NAME:=}"
+
+            # Fail early and legibly rather than deploying a server with no auth.
+            if [ -z "$MCP_PAT" ]; then
+              echo "ERROR: the MCP_PAT repository secret is empty or unset."
+              echo "Without it the server accepts unauthenticated requests. Set it and re-run."
+              exit 1
             fi
-            cd /home/ubuntu/ClinicalMCP
-            git fetch origin
-            git checkout main
-            git pull --ff-only origin main
+            if [ -z "$MCP_PUBLIC_URL" ]; then
+              echo "ERROR: the MCP_PUBLIC_URL repository secret is empty or unset."
+              exit 1
+            fi
 
-            python3 -m venv .venv || true
-            . .venv/bin/activate
-            python -m pip install --upgrade pip
-            python -m pip install -e .
+            # ---------- 1. host prerequisites ----------
+            if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+              echo "Installing Docker and Compose..."
+              sudo apt-get update -y
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                docker.io docker-compose-v2 git nginx
+              sudo systemctl enable --now docker
+            fi
 
-            cat > .env <<EOF
-            MCP_PAT=${{ secrets.MCP_PAT }}
-            MCP_ACCESS_URL=${{ secrets.MCP_PUBLIC_URL }}/mcp
-            MCP_PUBLIC_URL=${{ secrets.MCP_PUBLIC_URL }}
+            command -v nginx >/dev/null 2>&1 || {
+              sudo apt-get update -y
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
+            }
+
+            # ---------- 2. sync source ----------
+            if [ ! -d "$APP_DIR/.git" ]; then
+              git clone "$REPO_URL" "$APP_DIR"
+            fi
+            cd "$APP_DIR"
+            # Force HTTPS: the instance has no GitHub deploy key, so an SSH remote cannot fetch.
+            git remote set-url origin "$REPO_URL"
+            git fetch origin main
+            git checkout -B main origin/main
+            # Idempotent: discards any drift on the box so the deploy always matches main.
+            git reset --hard origin/main
+
+            # ---------- 3. runtime config ----------
+            # .env is gitignored, so it survives the reset above and is not committed.
+            umask 077
+            cat > .env <<'ENVEOF'
+            MCP_PAT=__MCP_PAT__
+            MCP_ACCESS_URL=__MCP_PUBLIC_URL__/mcp
+            MCP_PUBLIC_URL=__MCP_PUBLIC_URL__
             MCP_HOST=0.0.0.0
             MCP_PORT=8000
-            EOF
+            FINNHUB_API_KEY=__FINNHUB_API_KEY__
+            TWELVEDATA_API_KEY=__TWELVEDATA_API_KEY__
+            ENVEOF
+            # Substituted via python to keep secret values literal (no shell expansion of $, `, \).
+            python3 - <<'PYEOF'
+            import os
+            path = ".env"
+            repl = {
+                "__MCP_PAT__": os.environ.get("MCP_PAT", ""),
+                "__MCP_PUBLIC_URL__": os.environ.get("MCP_PUBLIC_URL", "").rstrip("/"),
+                "__FINNHUB_API_KEY__": os.environ.get("FINNHUB_API_KEY", ""),
+                "__TWELVEDATA_API_KEY__": os.environ.get("TWELVEDATA_API_KEY", "") or "demo",
+            }
+            text = open(path).read()
+            for k, v in repl.items():
+                text = text.replace(k, v)
+            open(path, "w").write(text)
+            PYEOF
+            chmod 600 .env
 
-            sudo tee /etc/systemd/system/clinicalmcp.service >/dev/null <<'EOF'
-            [Unit]
-            Description=ClinicalMCP Server
-            After=network.target
+            # ---------- 4. build and start ----------
+            sudo docker compose up -d --build --remove-orphans
+            sudo docker image prune -f
 
-            [Service]
-            WorkingDirectory=/home/ubuntu/ClinicalMCP
-            EnvironmentFile=/home/ubuntu/ClinicalMCP/.env
-            ExecStart=/home/ubuntu/ClinicalMCP/.venv/bin/python -m mcp_clinical.server
-            Restart=always
-            RestartSec=5
-            User=ubuntu
-            Group=ubuntu
-
-            [Install]
-            WantedBy=multi-user.target
-            EOF
-
-            sudo systemctl daemon-reload
-            sudo systemctl enable --now clinicalmcp.service
-            sudo systemctl restart clinicalmcp.service
-
-            sudo tee /etc/nginx/conf.d/clinicalmcp.conf >/dev/null <<'EOF'
+            # ---------- 5. reverse proxy ----------
+            # default_server so requests by raw IP also reach the app, not the nginx welcome page.
+            sudo tee /etc/nginx/conf.d/clinicalmcp.conf >/dev/null <<'NGINXEOF'
             server {
-                listen 80;
-                server_name ${{ secrets.EC2_HOST }};
+                listen 80 default_server;
+                server_name __SERVER_NAME__ _;
 
                 location / {
                     proxy_pass http://127.0.0.1:8000;
@@ -85,10 +145,68 @@ jobs:
                     proxy_set_header X-Real-IP $remote_addr;
                     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
                     proxy_set_header X-Forwarded-Proto $scheme;
+
+                    # MCP streamable HTTP keeps SSE streams open: buffering or a short
+                    # read timeout here truncates tool responses mid-stream.
+                    proxy_http_version 1.1;
+                    proxy_set_header Connection "";
+                    proxy_buffering off;
+                    proxy_cache off;
+                    chunked_transfer_encoding off;
+                    proxy_read_timeout 3600s;
+                    proxy_send_timeout 3600s;
                 }
             }
-            EOF
+            NGINXEOF
+            sudo sed -i "s|__SERVER_NAME__|${SERVER_NAME}|" /etc/nginx/conf.d/clinicalmcp.conf
+
+            # Ubuntu ships a default_server on :80; two of them is a config error.
+            sudo rm -f /etc/nginx/sites-enabled/default
 
             sudo nginx -t
             sudo systemctl enable --now nginx
             sudo systemctl reload nginx
+
+            # ---------- 6. smoke test ----------
+            echo "Waiting for the app to accept connections..."
+            for i in $(seq 1 30); do
+              if curl -sf -o /dev/null "http://127.0.0.1:8000/mcp" \
+                   -X POST -H "Authorization: Bearer ${MCP_PAT}" \
+                   -H 'Content-Type: application/json' \
+                   -H 'Accept: application/json, text/event-stream' \
+                   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"deploy-smoke","version":"1"}}}'; then
+                echo "Direct app check passed."
+                break
+              fi
+              if [ "$i" -eq 30 ]; then
+                echo "App did not come up. Recent container logs:"
+                sudo docker compose logs --tail=80 clinicalmcp || true
+                exit 1
+              fi
+              sleep 2
+            done
+
+            # Same request through nginx, to prove the proxy path works too.
+            PROXY_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/mcp" \
+              -X POST -H "Authorization: Bearer ${MCP_PAT}" \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"deploy-smoke","version":"1"}}}')
+            echo "Through nginx: HTTP ${PROXY_CODE}"
+            if [ "$PROXY_CODE" != "200" ]; then
+              echo "Proxy check failed."
+              sudo tail -n 40 /var/log/nginx/error.log || true
+              exit 1
+            fi
+
+            # Confirm the PAT gate actually rejects unauthenticated callers.
+            UNAUTH_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/mcp" -X POST \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' -d '{}')
+            echo "Unauthenticated request: HTTP ${UNAUTH_CODE} (expect 401)"
+            if [ "$UNAUTH_CODE" != "401" ]; then
+              echo "WARNING: endpoint is not enforcing the PAT."
+              exit 1
+            fi
+
+            echo "Deploy complete."

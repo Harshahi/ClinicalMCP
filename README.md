@@ -55,10 +55,44 @@ This project exposes an MCP server that can:
 
 Your MCP client should connect to:
 
-- URL: http://localhost:8000/mcp
+- URL: http://localhost:8000/mcp (or your EC2 HTTPS URL)
 - Auth header: Authorization: Bearer <your_pat>
 
-The server expects the same token in the `MCP_PAT` environment variable when it starts.
+The server expects the same token in the `MCP_PAT` environment variable when it starts. When `MCP_PAT` is set, requests without the bearer token are rejected with a 401 response.
+
+### VS Code MCP config
+
+Create a `.vscode/mcp.json` file with a PAT-based config like this:
+
+```json
+{
+  "servers": {
+    "clinicalmcp-local": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:clinicalmcp_pat}"
+      }
+    },
+    "clinicalmcp-ec2": {
+      "type": "http",
+      "url": "https://your-ec2-host.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:clinicalmcp_pat}"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "clinicalmcp_pat",
+      "type": "promptString",
+      "description": "ClinicalMCP PAT"
+    }
+  ]
+}
+```
+
+Use the EC2 entry when the app is deployed on your VM.
 
 ## Available tools
 
@@ -80,164 +114,75 @@ The server expects the same token in the `MCP_PAT` environment variable when it 
 
 ## Public EC2 deployment
 
-The safest public setup is:
+The app is deployed to EC2 as a Docker container fronted by NGINX:
 
 - EC2 instance with a public IP or Elastic IP
-- security group allowing `22`, `80`, and `443` inbound
-- NGINX listening on `80`/`443` and proxying to the MCP app on `127.0.0.1:8000`
-- `systemd` service running the Python app with `MCP_PAT` set via a `.env` file
-- GitHub Actions on pushes to `main` that SSHs into the instance and redeploys the app
+- security group allowing `22`, `80`, and `443` inbound (port `8000` stays closed)
+- the container publishes only to `127.0.0.1:8000`, so it is not reachable directly
+- NGINX listens on `80` and proxies to `127.0.0.1:8000`
+- `MCP_PAT` is supplied through a `.env` file written by the deploy workflow
+- GitHub Actions runs the tests, then SSHes into the instance and redeploys on pushes to `main`
 
-### EC2 setup
+Deployment is handled entirely by [.github/workflows/deploy-ec2.yml](.github/workflows/deploy-ec2.yml).
+It installs Docker and NGINX if they are missing, so a bare Ubuntu instance needs no manual
+preparation beyond SSH access and the security group rules.
 
-1. Launch an Ubuntu or Amazon Linux 2023 EC2 instance.
-2. Open inbound ports:
-   - `22` for SSH
-   - `80` for HTTP
-   - `443` for HTTPS
-3. Install nginx and Python dependencies on the EC2 VM:
+### One-time setup
 
-```bash
-sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip git nginx
-```
+1. Launch an Ubuntu EC2 instance.
+2. Open inbound ports `22`, `80`, and `443`. Do **not** open `8000`.
+3. Add the repository secrets listed below.
+4. Push to `main` (or run the workflow manually via **Actions -> Run workflow**).
 
-4. Clone the repo:
+### Required repository secrets
 
-```bash
-cd /home/ubuntu
-git clone git@github.com:Harshahi/ClinicalMCP.git
-cd ClinicalMCP
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
-cp .env.example .env
-```
+| Secret | Required | Purpose |
+| --- | --- | --- |
+| `EC2_HOST` | yes | Public DNS name or IP of the instance |
+| `EC2_USER` | yes | SSH user, `ubuntu` on Ubuntu AMIs |
+| `EC2_SSH_KEY` | yes | Full contents of the private key, including the BEGIN/END lines |
+| `MCP_PAT` | yes | Bearer token clients must send; the deploy fails if this is empty |
+| `MCP_PUBLIC_URL` | yes | Public base URL, e.g. `http://your-host` with no trailing slash |
+| `FINNHUB_API_KEY` | no | Preferred market price source |
+| `TWELVEDATA_API_KEY` | no | Fallback price source, defaults to `demo` |
 
-5. Update `.env` with a real PAT and your public URL:
+`MCP_ACCESS_URL` is derived automatically as `${MCP_PUBLIC_URL}/mcp` and should not be set separately.
 
-```bash
-MCP_PAT=your-real-pat
-MCP_ACCESS_URL=https://your-domain.example.com/mcp
-MCP_PUBLIC_URL=https://your-domain.example.com
-MCP_HOST=0.0.0.0
-MCP_PORT=8000
-```
+### What the workflow does
 
-6. Configure NGINX to proxy traffic:
+1. **test** job: installs the package and runs `pytest`. A failing test blocks the deploy.
+2. **deploy** job:
+   - installs `docker.io`, `docker-compose-v2`, `git`, and `nginx` if absent
+   - clones or fast-forwards the repo at `/home/ubuntu/ClinicalMCP` over HTTPS
+   - writes `.env` (mode `600`) from the repository secrets
+   - runs `docker compose up -d --build` and prunes dangling images
+   - installs the NGINX proxy config as the `default_server` on port `80`
+   - smoke tests the app directly, then through NGINX, and asserts that an
+     unauthenticated request is rejected with `401`
 
-```bash
-sudo tee /etc/nginx/conf.d/clinicalmcp.conf <<'EOF'
-server {
-    listen 80;
-    server_name your-domain.example.com;
+The deploy is idempotent: it runs `git reset --hard origin/main`, so the instance always
+matches `main`. `.env` is gitignored and survives the reset.
 
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-EOF
-
-sudo nginx -t
-sudo systemctl enable --now nginx
-```
-
-7. Create a `systemd` service:
+### Operating the deployed instance
 
 ```bash
-sudo tee /etc/systemd/system/clinicalmcp.service <<'EOF'
-[Unit]
-Description=ClinicalMCP Server
-After=network.target
+ssh -i /path/to/key.pem ubuntu@<EC2_HOST>
+cd /home/ubuntu/ClinicalMCP
 
-[Service]
-WorkingDirectory=/home/ubuntu/ClinicalMCP
-EnvironmentFile=/home/ubuntu/ClinicalMCP/.env
-ExecStart=/home/ubuntu/ClinicalMCP/.venv/bin/python -m mcp_clinical.server
-Restart=always
-RestartSec=5
-User=ubuntu
-Group=ubuntu
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now clinicalmcp.service
-sudo systemctl status clinicalmcp.service --no-pager
-```
-
-## GitHub Actions deployment to EC2
-
-Add the following repository secrets in GitHub:
-
-- `EC2_HOST`
-- `EC2_USER`
-- `EC2_SSH_KEY`
-- `MCP_PAT`
-- `MCP_PUBLIC_URL`
-
-Example workflow:
-
-```yaml
-name: deploy-to-ec2
-
-on:
-  push:
-    branches: [main]
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e .
-
-      - name: Deploy to EC2
-        uses: appleboy/ssh-action@v1.1.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            set -e
-            cd /home/ubuntu/ClinicalMCP || git clone git@github.com:Harshahi/ClinicalMCP.git /home/ubuntu/ClinicalMCP
-            cd /home/ubuntu/ClinicalMCP
-            git pull origin main
-            python3 -m venv .venv
-            . .venv/bin/activate
-            python -m pip install --upgrade pip
-            python -m pip install -e .
-            cat > .env <<EOF
-            MCP_PAT=${{ secrets.MCP_PAT }}
-            MCP_ACCESS_URL=${{ secrets.MCP_PUBLIC_URL }}/mcp
-            MCP_PUBLIC_URL=${{ secrets.MCP_PUBLIC_URL }}
-            MCP_HOST=0.0.0.0
-            MCP_PORT=8000
-            EOF
-            sudo cp infra/clinicalmcp.service /etc/systemd/system/clinicalmcp.service
-            sudo systemctl daemon-reload
-            sudo systemctl restart clinicalmcp.service
-            sudo systemctl reload nginx || true
+sudo docker compose ps               # container status and health
+sudo docker compose logs -f          # follow application logs
+sudo docker compose restart          # restart without rebuilding
+sudo docker compose up -d --build    # rebuild after a code change
 ```
 
 ## Notes
 
-- Use a public DNS name with HTTPS in front of the EC2 instance if you want a stable public URL.
-- If you want to terminate TLS at the EC2 load balancer or NGINX layer, install Certbot and configure `443` with Let’s Encrypt.
+- The NGINX config disables `proxy_buffering` and uses a long `proxy_read_timeout`. MCP
+  streamable HTTP holds SSE connections open, and the NGINX defaults would truncate
+  tool responses mid-stream.
+- Requests are served over plain HTTP, so the PAT crosses the network in cleartext. For
+  anything beyond testing, put TLS in front: point a DNS name at the instance and run
+  `sudo certbot --nginx`, then update `MCP_PUBLIC_URL` to the `https://` URL.
 - Keep the PAT in GitHub secrets and never commit it to source control.
+- `infra/clinicalmcp.service` is left over from the earlier systemd-based deployment and is
+  no longer used by the workflow.

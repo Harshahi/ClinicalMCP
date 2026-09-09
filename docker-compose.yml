@@ -4,11 +4,22 @@ services:
       context: .
     container_name: clinicalmcp
     ports:
-      - "8000:8000"
+      # Bound to loopback only: nginx on the host fronts this on :80/:443.
+      # Publishing 0.0.0.0:8000 would expose the app directly, bypassing the proxy.
+      - "127.0.0.1:8000:8000"
     environment:
       MCP_PAT: ${MCP_PAT:-demo-pat-123}
-      MCP_ACCESS_URL: ${MCP_ACCESS_URL:-http://ec2-18-191-206-22.us-east-2.compute.amazonaws.com:8000/mcp}
-      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-http://ec2-18-191-206-22.us-east-2.compute.amazonaws.com}
-      MCP_HOST: ${MCP_HOST:-0.0.0.0}
-      MCP_PORT: ${MCP_PORT:-8000}
+      MCP_ACCESS_URL: ${MCP_ACCESS_URL:-http://localhost:8000/mcp}
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-http://localhost:8000}
+      # Must stay 8000 to match the container-side port in the mapping above.
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8000
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      TWELVEDATA_API_KEY: ${TWELVEDATA_API_KEY:-demo}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), timeout=5).close()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
     restart: unless-stopped

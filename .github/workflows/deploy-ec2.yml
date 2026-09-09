@@ -48,7 +48,9 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           # Secrets travel as env vars, not inlined into the script text.
           envs: MCP_PAT,MCP_PUBLIC_URL,FINNHUB_API_KEY,TWELVEDATA_API_KEY,SERVER_NAME
-          script_stop: true
+          # Do NOT set script_stop here. It injects an exit-code check after every
+          # line of the script, and those injected lines land inside heredoc bodies
+          # and corrupt them. `set -euo pipefail` below already aborts on error.
           script: |
             set -euo pipefail
 
@@ -74,7 +76,7 @@ jobs:
             fi
 
             # ---------- 1. host prerequisites ----------
-            if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+            if ! command -v docker >/dev/null 2>&1 || ! sudo docker compose version >/dev/null 2>&1; then
               echo "Installing Docker and Compose..."
               sudo apt-get update -y
               sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -101,32 +103,33 @@ jobs:
 
             # ---------- 3. runtime config ----------
             # .env is gitignored, so it survives the reset above and is not committed.
+            # Written by python straight from the env vars: secret values stay literal,
+            # with no shell expansion of $, backticks or backslashes.
             umask 077
-            cat > .env <<'ENVEOF'
-            MCP_PAT=__MCP_PAT__
-            MCP_ACCESS_URL=__MCP_PUBLIC_URL__/mcp
-            MCP_PUBLIC_URL=__MCP_PUBLIC_URL__
-            MCP_HOST=0.0.0.0
-            MCP_PORT=8000
-            FINNHUB_API_KEY=__FINNHUB_API_KEY__
-            TWELVEDATA_API_KEY=__TWELVEDATA_API_KEY__
-            ENVEOF
-            # Substituted via python to keep secret values literal (no shell expansion of $, `, \).
             python3 - <<'PYEOF'
             import os
-            path = ".env"
-            repl = {
-                "__MCP_PAT__": os.environ.get("MCP_PAT", ""),
-                "__MCP_PUBLIC_URL__": os.environ.get("MCP_PUBLIC_URL", "").rstrip("/"),
-                "__FINNHUB_API_KEY__": os.environ.get("FINNHUB_API_KEY", ""),
-                "__TWELVEDATA_API_KEY__": os.environ.get("TWELVEDATA_API_KEY", "") or "demo",
-            }
-            text = open(path).read()
-            for k, v in repl.items():
-                text = text.replace(k, v)
-            open(path, "w").write(text)
+
+            public_url = os.environ.get("MCP_PUBLIC_URL", "").rstrip("/")
+            settings = [
+                ("MCP_PAT", os.environ.get("MCP_PAT", "")),
+                ("MCP_ACCESS_URL", f"{public_url}/mcp"),
+                ("MCP_PUBLIC_URL", public_url),
+                ("MCP_HOST", "0.0.0.0"),
+                ("MCP_PORT", "8000"),
+                ("FINNHUB_API_KEY", os.environ.get("FINNHUB_API_KEY", "")),
+                ("TWELVEDATA_API_KEY", os.environ.get("TWELVEDATA_API_KEY", "") or "demo"),
+            ]
+            with open(".env", "w") as handle:
+                for key, value in settings:
+                    handle.write(f"{key}={value}\n")
             PYEOF
             chmod 600 .env
+
+            # Fail loudly if the PAT did not survive into the file the container reads.
+            if ! grep -q "^MCP_PAT=." .env; then
+              echo "ERROR: .env was written without an MCP_PAT value."
+              exit 1
+            fi
 
             # ---------- 4. build and start ----------
             sudo docker compose up -d --build --remove-orphans

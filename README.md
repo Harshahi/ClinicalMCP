@@ -146,6 +146,7 @@ preparation beyond SSH access and the security group rules.
 | `FINNHUB_API_KEY` | no | Preferred market price source |
 | `TWELVEDATA_API_KEY` | no | Fallback price source, defaults to `demo` |
 | `MCP_ALLOWED_ORIGINS` | no | Comma-separated browser origins; empty refuses all of them |
+| `CLOUDFRONT_ORIGIN_SECRET` | no | Shared header value that locks the origin to CloudFront (see below) |
 
 `MCP_ACCESS_URL` is derived automatically as `${MCP_PUBLIC_URL}/mcp` and should not be set separately.
 
@@ -176,6 +177,53 @@ sudo docker compose restart          # restart without rebuilding
 sudo docker compose up -d --build    # rebuild after a code change
 ```
 
+## HTTPS via CloudFront
+
+CloudFront gives you TLS on its own `*.cloudfront.net` certificate, so no custom domain
+is required. Let's Encrypt cannot issue a certificate for an `*.amazonaws.com` hostname,
+which is why certbot on the instance is not an option here.
+
+**Understand the trade-off first.** CloudFront encrypts the client-to-CloudFront leg, but
+the CloudFront-to-EC2 leg stays plain HTTP, because CloudFront validates origin
+certificates against a public CA and an EC2 public hostname cannot have one. So the PAT is
+protected across the client's own network — coffee shop Wi-Fi, ISP, corporate proxy — but
+is still cleartext on the hop inside AWS. Steps 4 and 5 below reduce that to a
+CloudFront-only path rather than the open internet. If you need end-to-end TLS, use a real
+domain and certbot instead.
+
+Do these in order, so you never lock yourself out of a working endpoint:
+
+1. **Pick a secret** for the origin guard: `openssl rand -hex 32`.
+2. **Create the distribution** (CloudFront console -> Create distribution):
+   - Origin domain: your `EC2_HOST`
+   - Protocol: **HTTP only**, port 80
+   - Add a custom header: `X-Origin-Secret` = the secret from step 1
+   - Viewer protocol policy: **Redirect HTTP to HTTPS**
+   - Allowed methods: **GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE**
+   - Cache policy: **CachingDisabled**
+   - Origin request policy: **AllViewer**
+
+   `AllViewer` matters: without it CloudFront strips the `Authorization` header and every
+   request returns 401. `CachingDisabled` matters because MCP responses are per-session
+   and must never be served from cache.
+3. **Add the GitHub secrets** and redeploy: set `CLOUDFRONT_ORIGIN_SECRET` to the value
+   from step 1, and change `MCP_PUBLIC_URL` to `https://<id>.cloudfront.net`. Pushing to
+   `main` turns on the nginx origin guard and regenerates `MCP_ACCESS_URL`.
+4. **Verify** `https://<id>.cloudfront.net/mcp` answers, and that a direct request to
+   `http://<EC2_HOST>/mcp` now returns **403** because it lacks the secret header.
+5. **Restrict the security group**: change the port 80 rule's source from `0.0.0.0/0` to
+   the AWS-managed prefix list `com.amazonaws.global.cloudfront.origin-facing`. After this
+   the origin is unreachable except through CloudFront.
+
+The deploy already trusts `X-Forwarded-For` only from AWS's published CloudFront
+origin-facing ranges, refreshed from `ip-ranges.amazonaws.com` on every run. Without that,
+the rate limit would count every request as coming from a handful of edge IPs and throttle
+all users collectively instead of per client.
+
+If long tool calls ever cut off, raise the distribution's **origin response timeout**
+(default 30s). CloudFront streams responses fine, but will drop a stream that sits idle
+past that window.
+
 ## Security model
 
 - **Every request needs the PAT.** The check is fail-closed and applies to all paths, so
@@ -191,6 +239,12 @@ sudo docker compose up -d --build    # rebuild after a code change
   PAT cannot be brute forced.
 - **The container listens only on `127.0.0.1:8000`** and runs as an unprivileged user.
   Port `8000` is not open in the security group; all traffic goes through NGINX.
+- **SSH is key-only** (`PasswordAuthentication no`, `PermitRootLogin prohibit-password`),
+  and `fail2ban` bans an IP for an hour after 5 failed attempts in 10 minutes. Port `22`
+  stays open to `0.0.0.0/0` because GitHub-hosted runners deploy over SSH from rotating
+  IP ranges that cannot be expressed in a security group.
+- **Origin guard**: when `CLOUDFRONT_ORIGIN_SECRET` is set, NGINX returns 403 to any
+  request lacking the matching `X-Origin-Secret` header, so CloudFront cannot be bypassed.
 
 ## Notes
 

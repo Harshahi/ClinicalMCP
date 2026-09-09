@@ -42,13 +42,14 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           MCP_ALLOWED_ORIGINS: ${{ secrets.MCP_ALLOWED_ORIGINS }}
+          CLOUDFRONT_ORIGIN_SECRET: ${{ secrets.CLOUDFRONT_ORIGIN_SECRET }}
           SERVER_NAME: ${{ secrets.EC2_HOST }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           # Secrets travel as env vars, not inlined into the script text.
-          envs: MCP_PAT,MCP_PUBLIC_URL,FINNHUB_API_KEY,TWELVEDATA_API_KEY,MCP_ALLOWED_ORIGINS,SERVER_NAME
+          envs: MCP_PAT,MCP_PUBLIC_URL,FINNHUB_API_KEY,TWELVEDATA_API_KEY,MCP_ALLOWED_ORIGINS,CLOUDFRONT_ORIGIN_SECRET,SERVER_NAME
           # Do NOT set script_stop here. It injects an exit-code check after every
           # line of the script, and those injected lines land inside heredoc bodies
           # and corrupt them. `set -euo pipefail` below already aborts on error.
@@ -62,6 +63,7 @@ jobs:
             : "${FINNHUB_API_KEY:=}"
             : "${TWELVEDATA_API_KEY:=}"
             : "${MCP_ALLOWED_ORIGINS:=}"
+            : "${CLOUDFRONT_ORIGIN_SECRET:=}"
             : "${MCP_PAT:=}"
             : "${MCP_PUBLIC_URL:=}"
             : "${SERVER_NAME:=}"
@@ -85,6 +87,22 @@ jobs:
                 docker.io docker-compose-v2 git nginx
               sudo systemctl enable --now docker
             fi
+
+            # SSH is key-only, but fail2ban stops scanners from hammering it all day.
+            if ! command -v fail2ban-server >/dev/null 2>&1; then
+              sudo apt-get update -y
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban
+            fi
+            sudo tee /etc/fail2ban/jail.d/sshd.local >/dev/null <<'F2BEOF'
+            [sshd]
+            enabled  = true
+            backend  = systemd
+            maxretry = 5
+            findtime = 10m
+            bantime  = 1h
+            F2BEOF
+            sudo systemctl enable --now fail2ban
+            sudo systemctl restart fail2ban
 
             command -v nginx >/dev/null 2>&1 || {
               sudo apt-get update -y
@@ -140,6 +158,58 @@ jobs:
             sudo docker image prune -f
 
             # ---------- 5. reverse proxy ----------
+            # Behind CloudFront every request arrives from an edge IP, so limit_req would
+            # otherwise throttle per edge instead of per client. Trust X-Forwarded-For
+            # only from AWS's published CloudFront origin-facing ranges.
+            if curl -sf -m 30 https://ip-ranges.amazonaws.com/ip-ranges.json -o /tmp/aws-ranges.json; then
+              python3 - <<'PYEOF'
+            import json
+
+            with open("/tmp/aws-ranges.json") as handle:
+                data = json.load(handle)
+
+            directives = [
+                f"set_real_ip_from {prefix['ip_prefix']};"
+                for prefix in data.get("prefixes", [])
+                if prefix.get("service") == "CLOUDFRONT_ORIGIN_FACING"
+            ]
+            directives += [
+                f"set_real_ip_from {prefix['ipv6_prefix']};"
+                for prefix in data.get("ipv6_prefixes", [])
+                if prefix.get("service") == "CLOUDFRONT_ORIGIN_FACING"
+            ]
+            print(f"Trusting {len(directives)} CloudFront origin-facing ranges for real_ip")
+            directives += ["real_ip_header X-Forwarded-For;", "real_ip_recursive on;"]
+
+            with open("/tmp/cloudfront-realip.conf", "w") as handle:
+                handle.write("\n".join(directives) + "\n")
+            PYEOF
+              sudo mv /tmp/cloudfront-realip.conf /etc/nginx/conf.d/cloudfront-realip.conf
+            else
+              echo "WARNING: could not fetch AWS ip-ranges.json; keeping any existing real_ip config."
+            fi
+
+            # Require a shared secret header when one is configured, so the origin cannot
+            # be reached directly and CloudFront cannot be bypassed. Written by python so
+            # the secret stays literal; an empty file means the guard is simply off.
+            python3 - <<'PYEOF'
+            import os
+
+            secret = os.environ.get("CLOUDFRONT_ORIGIN_SECRET", "")
+            if secret:
+                body = (
+                    "# Reject anything that did not come through CloudFront.\n"
+                    f'if ($http_x_origin_secret != "{secret}") {{ return 403; }}\n'
+                )
+            else:
+                body = "# CLOUDFRONT_ORIGIN_SECRET is unset, so no origin guard is applied.\n"
+
+            with open("/tmp/origin-guard.conf", "w") as handle:
+                handle.write(body)
+            PYEOF
+            sudo mv /tmp/origin-guard.conf /etc/nginx/origin-guard.conf
+            sudo chmod 644 /etc/nginx/origin-guard.conf
+
             # default_server so requests by raw IP also reach the app, not the nginx welcome page.
             sudo tee /etc/nginx/conf.d/clinicalmcp.conf >/dev/null <<'NGINXEOF'
             # conf.d is included in the http context, which is where a zone must live.
@@ -152,6 +222,8 @@ jobs:
                 server_name __SERVER_NAME__ _;
 
                 location / {
+                    include /etc/nginx/origin-guard.conf;
+
                     # burst absorbs a normal client opening several streams at once;
                     # nodelay serves the burst immediately rather than queueing it.
                     limit_req zone=mcp_limit burst=20 nodelay;
@@ -209,8 +281,11 @@ jobs:
             echo "Waiting for nginx to serve the new config..."
             PROXY_CODE=000
             for i in $(seq 1 20); do
+              # The origin guard, when enabled, rejects requests without this header.
+              # Sending it unconditionally is harmless when the guard is off.
               PROXY_CODE=$(curl -s -m 15 -o /dev/null -w '%{http_code}' "http://127.0.0.1/mcp" \
                 -X POST -H "Authorization: Bearer ${MCP_PAT}" \
+                -H "X-Origin-Secret: ${CLOUDFRONT_ORIGIN_SECRET}" \
                 -H 'Content-Type: application/json' \
                 -H 'Accept: application/json, text/event-stream' \
                 -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"deploy-smoke","version":"1"}}}')
@@ -231,6 +306,7 @@ jobs:
 
             # Confirm the PAT gate actually rejects unauthenticated callers.
             UNAUTH_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/mcp" -X POST \
+              -H "X-Origin-Secret: ${CLOUDFRONT_ORIGIN_SECRET}" \
               -H 'Content-Type: application/json' \
               -H 'Accept: application/json, text/event-stream' -d '{}')
             echo "Unauthenticated request: HTTP ${UNAUTH_CODE} (expect 401)"

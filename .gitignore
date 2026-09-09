@@ -4,6 +4,11 @@
 *.key
 ClinTrailKey1.pem
 .env
+
+# Generated tokens (see generate_mcp_pat.ipynb). Never commit these.
+.secrets/
+*.secret
+
 .venv/
 __pycache__/
 *.pyc

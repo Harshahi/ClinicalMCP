@@ -1,0 +1,26 @@
+{
+  "servers": {
+    "clinicalmcp-prod": {
+      "type": "http",
+      "url": "http://ec2-18-191-206-22.us-east-2.compute.amazonaws.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:clinicalmcp_pat}"
+      }
+    },
+    "clinicalmcp-local": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:clinicalmcp_pat}"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "clinicalmcp_pat",
+      "type": "promptString",
+      "description": "ClinicalMCP PAT (must match the deployed MCP_PAT)",
+      "password": true
+    }
+  ]
+}

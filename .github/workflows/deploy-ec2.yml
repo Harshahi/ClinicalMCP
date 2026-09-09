@@ -146,6 +146,9 @@ jobs:
                     handle.write(f"{key}={value}\n")
             PYEOF
             chmod 600 .env
+            # Restore a normal umask: leaving it at 077 made every later file, including
+            # the nginx configs, mode 0600 and unreadable to anything but root.
+            umask 022
 
             # Fail loudly if the PAT did not survive into the file the container reads.
             if ! grep -q "^MCP_PAT=." .env; then
@@ -185,6 +188,10 @@ jobs:
                 handle.write("\n".join(directives) + "\n")
             PYEOF
               sudo mv /tmp/cloudfront-realip.conf /etc/nginx/conf.d/cloudfront-realip.conf
+              # mv preserves the ubuntu ownership from /tmp. An nginx config that a
+              # non-root user can rewrite is a directive-injection vector, so take it back.
+              sudo chown root:root /etc/nginx/conf.d/cloudfront-realip.conf
+              sudo chmod 644 /etc/nginx/conf.d/cloudfront-realip.conf
             else
               echo "WARNING: could not fetch AWS ip-ranges.json; keeping any existing real_ip config."
             fi
@@ -208,6 +215,7 @@ jobs:
                 handle.write(body)
             PYEOF
             sudo mv /tmp/origin-guard.conf /etc/nginx/origin-guard.conf
+            sudo chown root:root /etc/nginx/origin-guard.conf
             sudo chmod 644 /etc/nginx/origin-guard.conf
 
             # default_server so requests by raw IP also reach the app, not the nginx welcome page.
@@ -247,6 +255,10 @@ jobs:
             }
             NGINXEOF
             sudo sed -i "s|__SERVER_NAME__|${SERVER_NAME}|" /etc/nginx/conf.d/clinicalmcp.conf
+            # tee leaves an existing file's mode alone, so fix up anything an earlier
+            # deploy created while the umask was still 077.
+            sudo chown root:root /etc/nginx/conf.d/clinicalmcp.conf
+            sudo chmod 644 /etc/nginx/conf.d/clinicalmcp.conf
 
             # Ubuntu ships a default_server on :80; two of them is a config error.
             sudo rm -f /etc/nginx/sites-enabled/default

@@ -145,6 +145,7 @@ preparation beyond SSH access and the security group rules.
 | `MCP_PUBLIC_URL` | yes | Public base URL, e.g. `http://your-host` with no trailing slash |
 | `FINNHUB_API_KEY` | no | Preferred market price source |
 | `TWELVEDATA_API_KEY` | no | Fallback price source, defaults to `demo` |
+| `MCP_ALLOWED_ORIGINS` | no | Comma-separated browser origins; empty refuses all of them |
 
 `MCP_ACCESS_URL` is derived automatically as `${MCP_PUBLIC_URL}/mcp` and should not be set separately.
 
@@ -174,6 +175,22 @@ sudo docker compose logs -f          # follow application logs
 sudo docker compose restart          # restart without rebuilding
 sudo docker compose up -d --build    # rebuild after a code change
 ```
+
+## Security model
+
+- **Every request needs the PAT.** The check is fail-closed and applies to all paths, so
+  a route added later is protected by default rather than exposed by omission.
+- **The server refuses to start when `MCP_PAT` is empty**, instead of silently accepting
+  anonymous callers. Set `MCP_ALLOW_UNAUTHENTICATED=true` to override this locally.
+- **Tokens are compared with `hmac.compare_digest`**, so the PAT cannot be recovered a
+  byte at a time by timing the responses.
+- **Requests carrying an unrecognised `Origin` header are refused with 403.** This blocks
+  DNS-rebinding attacks from a web page. Non-browser MCP clients send no `Origin` and are
+  unaffected; list trusted origins in `MCP_ALLOWED_ORIGINS` if you need browser access.
+- **NGINX rate limits each client IP to 10 req/s** (`burst=20`, returning `429`), so the
+  PAT cannot be brute forced.
+- **The container listens only on `127.0.0.1:8000`** and runs as an unprivileged user.
+  Port `8000` is not open in the security group; all traffic goes through NGINX.
 
 ## Notes
 

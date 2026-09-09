@@ -16,6 +16,8 @@ services:
       MCP_PORT: 8000
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
       TWELVEDATA_API_KEY: ${TWELVEDATA_API_KEY:-demo}
+      # Comma-separated browser origins. Empty means no browser origin is trusted.
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), timeout=5).close()"]
       interval: 30s

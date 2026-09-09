@@ -1,3 +1,4 @@
+import hmac
 import os
 from typing import Any
 
@@ -10,11 +11,25 @@ from starlette.responses import JSONResponse
 
 load_dotenv()
 
-DEFAULT_PAT = "development-token"
 MCP_PAT = os.getenv("MCP_PAT", "")
 MCP_ACCESS_URL = os.getenv("MCP_ACCESS_URL", "http://localhost:8000/mcp")
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
+
+# Browser origins permitted to call this server. Empty means "no browser may".
+MCP_ALLOWED_ORIGINS = frozenset(
+    origin.strip()
+    for origin in os.getenv("MCP_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+)
+
+# Escape hatch for local development only. Must be set explicitly, so an
+# unauthenticated server is always a deliberate choice rather than an accident.
+MCP_ALLOW_UNAUTHENTICATED = os.getenv("MCP_ALLOW_UNAUTHENTICATED", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 mcp = FastMCP(
     "Clinical Research & Market Price MCP",
@@ -177,35 +192,71 @@ def get_company_price(ticker: str, range_name: str = "1d") -> dict[str, Any]:
     }
 
 
+def _json_rpc_error(status_code: int, code: int, message: str) -> JSONResponse:
+    return JSONResponse(
+        {"jsonrpc": "2.0", "id": None, "error": {"code": code, "message": message}},
+        status_code=status_code,
+    )
+
+
+def _token_matches(token: str) -> bool:
+    """Compare in constant time so the PAT cannot be recovered byte by byte."""
+    return hmac.compare_digest(token.encode("utf-8"), MCP_PAT.encode("utf-8"))
+
+
 class RequirePatMiddleware(BaseHTTPMiddleware):
-    """Require a bearer token when a PAT is configured on the server."""
+    """Require a bearer token on every request.
+
+    Deliberately fail-closed. The check applies to all paths rather than a list
+    of protected prefixes, so a route added later is guarded by default instead
+    of being exposed by omission.
+    """
 
     async def dispatch(self, request, call_next):
-        if not MCP_PAT:
-            return await call_next(request)
+        # DNS-rebinding protection. Browsers always attach Origin on cross-site
+        # requests, so an unrecognised value means the caller is a page we do
+        # not trust. Non-browser MCP clients send no Origin and are unaffected.
+        origin = request.headers.get("Origin")
+        if origin and origin not in MCP_ALLOWED_ORIGINS:
+            return _json_rpc_error(403, -32003, f"Forbidden: origin {origin} is not allowed")
 
-        if request.url.path.startswith("/mcp") or request.url.path == "/":
-            auth_header = request.headers.get("Authorization", "")
-            token = auth_header.split(" ", 1)[1].strip() if " " in auth_header else ""
-            if not auth_header.lower().startswith("bearer ") or token != MCP_PAT:
-                return JSONResponse(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": None,
-                        "error": {
-                            "code": -32001,
-                            "message": "Unauthorized: send Authorization: Bearer <your_pat>",
-                        },
-                    },
-                    status_code=401,
-                )
+        if not MCP_PAT:
+            if MCP_ALLOW_UNAUTHENTICATED:
+                return await call_next(request)
+            # Refuse to serve rather than silently accept anonymous callers.
+            return _json_rpc_error(
+                503,
+                -32002,
+                "Server misconfigured: MCP_PAT is not set. Set it, or set "
+                "MCP_ALLOW_UNAUTHENTICATED=true to run without auth locally.",
+            )
+
+        scheme, _, token = request.headers.get("Authorization", "").partition(" ")
+        if scheme.strip().lower() != "bearer" or not _token_matches(token.strip()):
+            return _json_rpc_error(
+                401, -32001, "Unauthorized: send Authorization: Bearer <your_pat>"
+            )
+
         return await call_next(request)
 
 
 def main() -> None:
+    if not MCP_PAT and not MCP_ALLOW_UNAUTHENTICATED:
+        raise SystemExit(
+            "Refusing to start: MCP_PAT is not set, so the server would accept "
+            "unauthenticated requests.\nSet MCP_PAT, or set "
+            "MCP_ALLOW_UNAUTHENTICATED=true if you really want an open server locally."
+        )
+
     print(f"Starting Clinical Research MCP server on {MCP_HOST}:{MCP_PORT}")
     print(f"Access URL: {MCP_ACCESS_URL}")
     print(f"PAT env var: MCP_PAT (value is set: {bool(MCP_PAT)})")
+    if MCP_ALLOWED_ORIGINS:
+        print(f"Allowed browser origins: {', '.join(sorted(MCP_ALLOWED_ORIGINS))}")
+    else:
+        print("Allowed browser origins: none (requests carrying an Origin header are refused)")
+    if not MCP_PAT:
+        print("WARNING: running WITHOUT authentication because MCP_ALLOW_UNAUTHENTICATED is set.")
 
     app = RequirePatMiddleware(mcp.streamable_http_app())
     uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)

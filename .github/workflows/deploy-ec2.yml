@@ -41,13 +41,14 @@ jobs:
           MCP_PUBLIC_URL: ${{ secrets.MCP_PUBLIC_URL }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          MCP_ALLOWED_ORIGINS: ${{ secrets.MCP_ALLOWED_ORIGINS }}
           SERVER_NAME: ${{ secrets.EC2_HOST }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           # Secrets travel as env vars, not inlined into the script text.
-          envs: MCP_PAT,MCP_PUBLIC_URL,FINNHUB_API_KEY,TWELVEDATA_API_KEY,SERVER_NAME
+          envs: MCP_PAT,MCP_PUBLIC_URL,FINNHUB_API_KEY,TWELVEDATA_API_KEY,MCP_ALLOWED_ORIGINS,SERVER_NAME
           # Do NOT set script_stop here. It injects an exit-code check after every
           # line of the script, and those injected lines land inside heredoc bodies
           # and corrupt them. `set -euo pipefail` below already aborts on error.
@@ -60,6 +61,7 @@ jobs:
             # Optional secrets default to empty so `set -u` does not abort on them.
             : "${FINNHUB_API_KEY:=}"
             : "${TWELVEDATA_API_KEY:=}"
+            : "${MCP_ALLOWED_ORIGINS:=}"
             : "${MCP_PAT:=}"
             : "${MCP_PUBLIC_URL:=}"
             : "${SERVER_NAME:=}"
@@ -118,6 +120,8 @@ jobs:
                 ("MCP_PORT", "8000"),
                 ("FINNHUB_API_KEY", os.environ.get("FINNHUB_API_KEY", "")),
                 ("TWELVEDATA_API_KEY", os.environ.get("TWELVEDATA_API_KEY", "") or "demo"),
+                # Empty means no browser origin is trusted, which is the safe default.
+                ("MCP_ALLOWED_ORIGINS", os.environ.get("MCP_ALLOWED_ORIGINS", "")),
             ]
             with open(".env", "w") as handle:
                 for key, value in settings:
@@ -138,11 +142,20 @@ jobs:
             # ---------- 5. reverse proxy ----------
             # default_server so requests by raw IP also reach the app, not the nginx welcome page.
             sudo tee /etc/nginx/conf.d/clinicalmcp.conf >/dev/null <<'NGINXEOF'
+            # conf.d is included in the http context, which is where a zone must live.
+            # 10 req/s per client IP, so guessing the PAT is not a matter of brute force.
+            limit_req_zone $binary_remote_addr zone=mcp_limit:10m rate=10r/s;
+            limit_req_status 429;
+
             server {
                 listen 80 default_server;
                 server_name __SERVER_NAME__ _;
 
                 location / {
+                    # burst absorbs a normal client opening several streams at once;
+                    # nodelay serves the burst immediately rather than queueing it.
+                    limit_req zone=mcp_limit burst=20 nodelay;
+
                     proxy_pass http://127.0.0.1:8000;
                     proxy_set_header Host $host;
                     proxy_set_header X-Real-IP $remote_addr;
